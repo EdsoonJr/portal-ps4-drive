@@ -68,6 +68,13 @@
 
     /* Progresso */
     .progress-section { margin-top: 20px; display: none; }
+    .batch-status {
+      font-size: 14px;
+      color: #58a6ff;
+      font-weight: 600;
+      margin-bottom: 12px;
+      text-align: center;
+    }
     .file-info { font-size: 13px; color: #8b949e; margin-bottom: 8px; display: flex; justify-content: space-between; }
     .progress-bar-bg { background-color: #21262d; border-radius: 6px; height: 12px; overflow: hidden; width: 100%; }
     .progress-bar-fill { background: linear-gradient(90deg, #1f6feb, #238636); height: 100%; width: 0%; transition: width 0.08s ease; }
@@ -184,12 +191,14 @@
       </div>
 
       <div class="dropzone" id="dropzone">
-        <p>📁 Arraste seu arquivo .pkg aqui ou clique para selecionar</p>
-        <span>Envio direto de alta velocidade para os servidores da Google</span>
-        <input type="file" id="fileInput" accept=".pkg">
+        <p>📁 Arraste suas partes .pkg aqui ou clique para selecionar</p>
+        <span>Suporta seleção de múltiplos arquivos e pastas multipartes</span>
+        <!-- Atributo multiple adicionado -->
+        <input type="file" id="fileInput" multiple>
       </div>
 
       <div class="progress-section" id="progressSection">
+        <div class="batch-status" id="batchStatus">Enviando parte 1 de 1...</div>
         <div class="file-info">
           <span id="fileNameDisplay">arquivo.pkg</span>
           <span id="percentText">0%</span>
@@ -224,6 +233,7 @@
     const dropzone = document.getElementById('dropzone');
     const fileInput = document.getElementById('fileInput');
     const progressSection = document.getElementById('progressSection');
+    const batchStatus = document.getElementById('batchStatus');
     const progressFill = document.getElementById('progressFill');
     const percentText = document.getElementById('percentText');
     const fileNameDisplay = document.getElementById('fileNameDisplay');
@@ -232,7 +242,6 @@
     const statusMsg = document.getElementById('statusMsg');
     const senhaInput = document.getElementById('senhaInput');
 
-    // Carrega senha salva no navegador se houver
     if (localStorage.getItem('portal_ps4_senha')) {
       senhaInput.value = localStorage.getItem('portal_ps4_senha');
     }
@@ -241,17 +250,32 @@
     });
 
     const CHUNK_SIZE = 32 * 1024 * 1024;
+    let isUploading = false;
 
-    dropzone.addEventListener('click', () => fileInput.click());
-    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('click', () => {
+      if (!isUploading) fileInput.click();
+    });
+
+    dropzone.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      if (!isUploading) dropzone.classList.add('dragover');
+    });
+
     dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+
     dropzone.addEventListener('drop', (e) => {
       e.preventDefault();
       dropzone.classList.remove('dragover');
-      if (e.dataTransfer.files.length > 0) startUpload(e.dataTransfer.files[0]);
+      if (isUploading) return;
+      if (e.dataTransfer.files.length > 0) {
+        processarFilaArquivos(Array.from(e.dataTransfer.files));
+      }
     });
+
     fileInput.addEventListener('change', (e) => {
-      if (e.target.files.length > 0) startUpload(e.target.files[0]);
+      if (e.target.files.length > 0) {
+        processarFilaArquivos(Array.from(e.target.files));
+      }
     });
 
     function formatBytes(bytes) {
@@ -284,7 +308,69 @@
       });
     }
 
-    async function startUpload(file) {
+    async function enviarArquivoIndividual(file, index, totalArquivos, senha) {
+      batchStatus.textContent = `📦 Enviando arquivo ${index + 1} de ${totalArquivos}`;
+      fileNameDisplay.textContent = file.name;
+      statusMsg.className = 'status-msg';
+      statusMsg.textContent = 'Solicitando sessão de upload ao Google Drive...';
+      progressFill.style.width = '0%';
+      percentText.textContent = '0%';
+
+      const res = await fetch('/api/iniciar-upload', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'X-Senha': senha
+        },
+        body: JSON.stringify({ nome: file.name, tamanho: file.size })
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.uploadUrl) throw new Error(data.detail || 'Erro ao gerar sessão.');
+
+      const uploadUrl = data.uploadUrl;
+      statusMsg.textContent = 'Enviando blocos diretamente para o Google Drive...';
+
+      let start = 0;
+      let lastTime = Date.now();
+      let lastLoadedGlobal = 0;
+
+      while (start < file.size) {
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const chunk = file.slice(start, end);
+
+        const status = await uploadChunkComProgresso(
+          uploadUrl, 
+          chunk, 
+          start, 
+          end, 
+          file.size, 
+          (bytesEnviadosNoChunk) => {
+            const totalEnviadoAtual = start + bytesEnviadosNoChunk;
+            const percent = Math.min(100, Math.floor((totalEnviadoAtual / file.size) * 100));
+
+            progressFill.style.width = percent + '%';
+            percentText.textContent = percent + '%';
+            uploadedDisplay.textContent = `${formatBytes(totalEnviadoAtual)} / ${formatBytes(file.size)}`;
+
+            const now = Date.now();
+            const timeDiff = (now - lastTime) / 1000;
+            if (timeDiff >= 0.25) {
+              const bytesDiff = totalEnviadoAtual - lastLoadedGlobal;
+              const speed = bytesDiff / timeDiff;
+              speedDisplay.textContent = `${formatBytes(speed)}/s`;
+              lastTime = now;
+              lastLoadedGlobal = totalEnviadoAtual;
+            }
+          }
+        );
+
+        start = end;
+        if (status === 200 || status === 201) break;
+      }
+    }
+
+    async function processarFilaArquivos(arquivos) {
       const senha = senhaInput.value.trim();
       if (!senha) {
         alert("Por favor, digite a Chave de Acesso da Comunidade antes de enviar!");
@@ -292,75 +378,28 @@
         return;
       }
 
+      isUploading = true;
+      dropzone.style.opacity = '0.5';
+      dropzone.style.pointerEvents = 'none';
       progressSection.style.display = 'block';
-      fileNameDisplay.textContent = file.name;
-      statusMsg.className = 'status-msg';
-      statusMsg.textContent = 'Solicitando sessão de upload ao Google Drive...';
-      progressFill.style.width = '0%';
-      percentText.textContent = '0%';
 
       try {
-        const res = await fetch('/api/iniciar-upload', {
-          method: 'POST',
-          headers: { 
-            'Content-Type': 'application/json',
-            'X-Senha': senha
-          },
-          body: JSON.stringify({ nome: file.name, tamanho: file.size })
-        });
-        const data = await res.json();
-        if (!res.ok || !data.uploadUrl) throw new Error(data.detail || 'Erro ao gerar sessão.');
-
-        const uploadUrl = data.uploadUrl;
-        statusMsg.textContent = 'Enviando diretamente para os servidores da Google...';
-
-        let start = 0;
-        let lastTime = Date.now();
-        let lastLoadedGlobal = 0;
-
-        while (start < file.size) {
-          const end = Math.min(start + CHUNK_SIZE, file.size);
-          const chunk = file.slice(start, end);
-
-          const status = await uploadChunkComProgresso(
-            uploadUrl, 
-            chunk, 
-            start, 
-            end, 
-            file.size, 
-            (bytesEnviadosNoChunk) => {
-              const totalEnviadoAtual = start + bytesEnviadosNoChunk;
-              const percent = Math.min(100, Math.floor((totalEnviadoAtual / file.size) * 100));
-
-              progressFill.style.width = percent + '%';
-              percentText.textContent = percent + '%';
-              uploadedDisplay.textContent = `${formatBytes(totalEnviadoAtual)} / ${formatBytes(file.size)}`;
-
-              const now = Date.now();
-              const timeDiff = (now - lastTime) / 1000;
-              if (timeDiff >= 0.25) {
-                const bytesDiff = totalEnviadoAtual - lastLoadedGlobal;
-                const speed = bytesDiff / timeDiff;
-                speedDisplay.textContent = `${formatBytes(speed)}/s`;
-                lastTime = now;
-                lastLoadedGlobal = totalEnviadoAtual;
-              }
-            }
-          );
-
-          start = end;
-          if (status === 200 || status === 201) break;
+        for (let i = 0; i < arquivos.length; i++) {
+          await enviarArquivoIndividual(arquivos[i], i, arquivos.length, senha);
         }
 
-        progressFill.style.width = '100%';
-        percentText.textContent = '100%';
-        uploadedDisplay.textContent = `${formatBytes(file.size)} / ${formatBytes(file.size)}`;
+        batchStatus.textContent = `🎉 Concluído: todos os ${arquivos.length} arquivos foram enviados!`;
         statusMsg.className = 'status-msg success';
-        statusMsg.textContent = '✅ Upload 100% concluído! O jogo já está na Inbox.';
+        statusMsg.textContent = '✅ Todos os arquivos já estão na Inbox do Google Drive.';
         speedDisplay.textContent = 'Finalizado';
       } catch (err) {
         statusMsg.className = 'status-msg error';
         statusMsg.textContent = `❌ Falha: ${err.message}`;
+      } finally {
+        isUploading = false;
+        dropzone.style.opacity = '1';
+        dropzone.style.pointerEvents = 'auto';
+        fileInput.value = '';
       }
     }
 
